@@ -1,0 +1,27 @@
+# Fork-only: the chart's generators and unit tests, with the Helm version ESO's CI uses.
+name: Chart generators and unit tests
+on:
+  push:
+    branches: [chart-check]
+permissions:
+  contents: read
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.14.2
+      - name: Regenerate and test as the Makefile does
+        run: |
+          set -euo pipefail
+          make helm.schema.update helm.docs helm.test.update
+          make helm.test
+          git status --short
+          git diff -- deploy/charts > chart-generated.patch
+          cat chart-generated.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chart-generated-patch
+          path: chart-generated.patch
