@@ -1,0 +1,94 @@
+# Fork-only: CNTi essential tests on the chart from main and from the fix,
+# and a functional check of the fix.
+name: CNTi runAsGroup verification
+on:
+  push:
+    branches: [cnti-verify]
+permissions:
+  contents: read
+jobs:
+  cnti:
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [upstream-main, fix]
+    name: "essential: ${{ matrix.ref }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.14.2
+      - name: Chart from ${{ matrix.ref }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.ref }}" = upstream-main ]; then
+            git remote add upstream https://github.com/external-secrets/external-secrets.git
+            git fetch -q upstream main
+            git checkout -q upstream/main -- deploy/charts/external-secrets
+          fi
+          grep -n -A1 "runAsUser: 1000" deploy/charts/external-secrets/values.yaml
+          # The CRD templates are generated, as for a chart release.
+          make helm.generate
+          ls deploy/charts/external-secrets/templates/crds | wc -l
+          helm dependency build deploy/charts/external-secrets
+      - uses: lfn-cnti/testsuite-action@70536fda55fcb11f4f7463175fe9d57c86b85574 # v1.2.0
+        with:
+          version: v2.3.0
+          cnf_config: .github/cnti/cnti-testsuite.yaml
+          tests: cert
+          log_level: info
+          install_timeout: "900"
+          fail_on_failure: "false"
+          artifact_name: results-${{ matrix.ref }}
+      - name: Process identities on the nodes
+        if: always()
+        run: |
+          for n in $(kind get nodes --name cnti-testsuite 2>/dev/null || docker ps --format '{{.Names}}' | grep cnti-testsuite); do
+            docker exec "$n" sh -c 'for d in /proc/[0-9]*; do c=$(tr "\0" " " < $d/cmdline 2>/dev/null); case "$c" in /bin/external-secrets*) echo "$c"; grep -E "^(Uid|Gid|Groups):" $d/status;; esac; done' || true
+          done
+      - name: Functional check (SecretStore and ExternalSecret through the webhook)
+        if: always()
+        run: |
+          set -euo pipefail
+          kubectl -n external-secrets get pods -o wide
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: external-secrets.io/v1
+          kind: SecretStore
+          metadata:
+            name: fake
+            namespace: default
+          spec:
+            provider:
+              fake:
+                data:
+                  - key: /cnti/value
+                    value: works
+          ---
+          apiVersion: external-secrets.io/v1
+          kind: ExternalSecret
+          metadata:
+            name: cnti
+            namespace: default
+          spec:
+            refreshInterval: 10s
+            secretStoreRef:
+              name: fake
+              kind: SecretStore
+            target:
+              name: cnti-synced
+            data:
+              - secretKey: value
+                remoteRef:
+                  key: /cnti/value
+          YAML
+          for i in $(seq 1 30); do
+            v=$(kubectl -n default get secret cnti-synced -o jsonpath='{.data.value}' 2>/dev/null | base64 -d || true)
+            [ "$v" = works ] && { echo "synced: $v"; break; }; sleep 2
+          done
+          [ "$v" = works ] || { kubectl -n default describe externalsecret cnti; exit 1; }
+          kubectl -n external-secrets get pods
+          kubectl -n external-secrets logs deploy/external-secrets-webhook --tail=20
